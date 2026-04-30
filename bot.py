@@ -88,12 +88,15 @@ SERVICES = {
 }
 
 # Import ViOTP API
-try:
-    from viotp import ViOTP
-    viotp_api = ViOTP(VIOTP_TOKEN)
-except ImportError:
-    print("Warning: viotp library not installed. Install with: pip install viotp")
-    viotp_api = None
+# try:
+#     from viotp import ViOTP
+#     viotp_api = ViOTP(VIOTP_TOKEN)
+# except ImportError:
+#     print("Warning: viotp library not installed. Install with: pip install viotp")
+#     viotp_api = None
+
+# Tạm thời disable viotp để bot có thể chạy
+viotp_api = None
 
 # DB & polling
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
@@ -171,9 +174,9 @@ def init_db():
                 request_id TEXT NOT NULL,
                 phone_number TEXT,
                 service_name TEXT,
-                cost INTEGER,
+                price INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                rented_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -184,7 +187,8 @@ def init_db():
                 bank_type TEXT NOT NULL,
                 stk TEXT NOT NULL,
                 name TEXT NOT NULL,
-                status TEXT DEFAULT 'available',
+                price INTEGER DEFAULT 0,
+                is_sold INTEGER DEFAULT 0,
                 sold_to INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -199,8 +203,23 @@ def init_db():
                 password TEXT NOT NULL,
                 realname TEXT DEFAULT '',
                 pin TEXT DEFAULT '111222',
-                status TEXT DEFAULT 'available',
+                price INTEGER DEFAULT 0,
+                is_sold INTEGER DEFAULT 0,
                 sold_to INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Bảng proxy_orders (Lịch sử mua Proxy)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS proxy_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                proxy_data TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -230,9 +249,10 @@ def init_db():
             "price_shopacc": "16999",
             "price_proxy_static": "2345",
             "feat_rent": "1",
-            "feat_databank": "1",
+            "feat_databank": "1", 
             "feat_shopacc": "1",
-            "feat_proxy_static": "1"
+            "feat_proxy_static": "1",
+            "feat_shop": "1"  # Bật toàn bộ shop
         }
         
         # Combine existing defaults with new settings
@@ -1587,6 +1607,7 @@ def admin_menu_markup():
     )
     kb.row(
         InlineKeyboardButton("💵 Chỉnh Giá", callback_data="adm_prices"),
+        InlineKeyboardButton("🛒 Quản Lý Shop", callback_data="adm_shop"),
     )
     kb.row(
         InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
@@ -1655,10 +1676,14 @@ def handle_admin_cb(call):
         ask_set_price(chat_id, msg_id, data.replace("adm_price_", "", 1))
     elif data == "adm_check":
         ask_input_check(chat_id, msg_id)
+    elif data == "adm_shop":
+        show_shop_management(chat_id, msg_id)
     elif data == "adm_broadcast":
         ask_broadcast_text(chat_id, msg_id)
     elif data == "adm_broadcast_send":
         do_broadcast_send(call)
+    elif data.startswith("adm_shop_"):
+        handle_shop_management(call, data.replace("adm_shop_", "", 1))
 
 
 def _safe_edit(chat_id, msg_id, text, markup=None):
@@ -1669,14 +1694,508 @@ def _safe_edit(chat_id, msg_id, text, markup=None):
         bot.send_message(chat_id, text, reply_markup=markup)
 
 
+def show_shop_management(chat_id, msg_id):
+    """Hiển thị menu quản lý shop"""
+    # Lấy thống kê kho
+    acc_summary = get_shop_accounts_summary()
+    dbank_summary = get_available_data_banks_summary()
+    
+    acc_text = "\n".join([f"  🎮 {s['site'].upper()}: <b>{s['count']}</b> acc" for s in acc_summary]) if acc_summary else "  <i>Trống</i>"
+    dbank_text = "\n".join([f"  📁 {b['bank_type']}: <b>{b['count']}</b> data" for b in dbank_summary]) if dbank_summary else "  <i>Trống</i>"
+    
+    markup = InlineKeyboardMarkup()
+    markup.row(
+        InlineKeyboardButton("➕ Thêm ACC", callback_data="adm_shop_add_acc"),
+        InlineKeyboardButton("➕ Thêm Data Bank", callback_data="adm_shop_add_dbank")
+    )
+    markup.row(
+        InlineKeyboardButton("📋 Xem Kho ACC", callback_data="adm_shop_view_acc"),
+        InlineKeyboardButton("📋 Xem Kho Data Bank", callback_data="adm_shop_view_dbank")
+    )
+    markup.row(
+        InlineKeyboardButton("🗑️ Xóa Sản Phẩm", callback_data="adm_shop_delete"),
+        InlineKeyboardButton("🔙 Quay lại", callback_data="adm_main")
+    )
+    
+    text = (
+        f"🛒 <b>QUẢN LÝ SHOP</b>\n\n"
+        f"📊 <b>Thống Kê Kho:</b>\n\n"
+        f"🎮 <b>ACC TÂN THỦ:</b>\n{acc_text}\n\n"
+        f"💳 <b>DATA BANK:</b>\n{dbank_text}\n\n"
+        f"👇 <i>Chọn chức năng quản lý:</i>"
+    )
+    
+    _safe_edit(chat_id, msg_id, text, markup)
+
+
+def handle_shop_management(call, action):
+    """Xử lý các action quản lý shop"""
+    chat_id = call.from_user.id
+    msg_id = call.message.message_id
+    
+    if action == "add_acc":
+        markup = InlineKeyboardMarkup()
+        for site in ["f168", "c168", "cm88", "sc88", "fly88"]:
+            markup.row(InlineKeyboardButton(f"➕ Thêm ACC {site.upper()}", callback_data=f"adm_shop_add_acc_{site}"))
+        markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+        
+        text = "🛒 <b>THÊM ACC TÂN THỦ</b>\n\nChọn loại acc muốn thêm:"
+        _safe_edit(chat_id, msg_id, text, markup)
+        
+    elif action.startswith("add_acc_"):
+        site = action.replace("add_acc_", "")
+        msg = bot.send_message(chat_id, 
+            f"📝 <b>NHẬP ACC {site.upper()}</b>\n\n"
+            f"Định dạng: <code>username|password|realname|pin</code>\n"
+            f"Mỗi dòng 1 acc, pin mặc định là 111222 nếu không nhập\n\n"
+            f"Ví dụ:\n"
+            f"<code>user123|pass456|NGUYEN VAN A|111222</code>\n"
+            f"<code>user789|pass012|TRAN VAN B</code>\n\n"
+            f"Gửi file hoặc nhập trực tiếp. Gõ /huy để hủy."
+        )
+        bot.register_next_step_handler(msg, process_add_shop_acc, site)
+        
+    elif action == "add_dbank":
+        msg = bot.send_message(chat_id,
+            "📝 <b>NHẬP DATA BANK</b>\n\n"
+            "Định dạng: <code>bank_type|stk|name</code>\n"
+            "Mỗi dòng 1 data\n\n"
+            "Ví dụ:\n"
+            "<code>VCB|123456789|NGUYEN VAN A</code>\n"
+            "<code>TCB|987654321|TRAN VAN B</code>\n\n"
+            "Gửi file hoặc nhập trực tiếp. Gõ /huy để hủy."
+        )
+        bot.register_next_step_handler(msg, process_add_data_bank)
+        
+    elif action == "view_acc":
+        show_shop_inventory(chat_id, msg_id, "acc")
+        
+    elif action == "view_dbank":
+        show_shop_inventory(chat_id, msg_id, "dbank")
+        
+    elif action.startswith("acc_detail_"):
+        site = action.replace("acc_detail_", "")
+        show_acc_detail(chat_id, msg_id, site)
+        
+    elif action.startswith("dbank_detail_"):
+        bank_type = action.replace("dbank_detail_", "")
+        show_dbank_detail(chat_id, msg_id, bank_type)
+        
+    elif action == "delete_acc":
+        msg = bot.send_message(chat_id,
+            "🗑️ <b>XÓA ACC</b>\n\nNhập username acc cần xóa (mỗi dòng 1 username):"
+        )
+        bot.register_next_step_handler(msg, process_delete_acc)
+        
+    elif action == "delete_dbank":
+        msg = bot.send_message(chat_id,
+            "🗑️ <b>XÓA DATA BANK</b>\n\nNhập STK data bank cần xóa (mỗi dòng 1 STK):"
+        )
+        bot.register_next_step_handler(msg, process_delete_dbank)
+        
+    elif action == "delete":
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("🗑️ Xóa ACC", callback_data="adm_shop_delete_acc"),
+            InlineKeyboardButton("🗑️ Xóa Data Bank", callback_data="adm_shop_delete_dbank")
+        )
+        markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+        
+        text = "🗑️ <b>XÓA SẢN PHẨM</b>\n\nChọn loại sản phẩm muốn xóa:"
+        _safe_edit(chat_id, msg_id, text, markup)
+
+
+def process_add_shop_acc(message, site):
+    """Xử lý thêm acc shop"""
+    chat_id = message.chat.id
+    text = ""
+    
+    if message.text and message.text.strip().lower() == "/huy":
+        bot.send_message(chat_id, "✅ Đã hủy thêm acc.", reply_markup=back_to_admin_markup())
+        return
+    
+    if message.document:
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            text = downloaded_file.decode('utf-8')
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Lỗi đọc file: {e}")
+            return
+    elif message.text:
+        text = message.text.strip()
+    
+    if not text:
+        bot.send_message(chat_id, "❌ Không tìm thấy dữ liệu!")
+        return
+    
+    lines = text.split('\n')
+    accounts = []
+    errors = 0
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        parts = [p.strip() for p in line.split('|')]
+        
+        if len(parts) >= 2:
+            username = parts[0]
+            password = parts[1]
+            realname = parts[2] if len(parts) >= 3 else ""
+            pin = parts[3] if len(parts) >= 4 else "111222"
+            accounts.append({
+                "site": site,
+                "username": username,
+                "password": password,
+                "realname": realname,
+                "pin": pin
+            })
+        else:
+            errors += 1
+    
+    if accounts:
+        add_shop_accounts_bulk(accounts)
+    
+    bot.send_message(chat_id,
+        f"✅ <b>HOÀN TẤT THÊM ACC {site.upper()}</b>\n\n"
+        f"✅ Thêm thành công: <b>{len(accounts)}</b>\n"
+        f"❌ Lỗi định dạng: <b>{errors}</b>",
+        reply_markup=back_to_admin_markup()
+    )
+
+
+def process_add_data_bank(message):
+    """Xử lý thêm data bank"""
+    chat_id = message.chat.id
+    text = ""
+    
+    if message.text and message.text.strip().lower() == "/huy":
+        bot.send_message(chat_id, "✅ Đã hủy thêm data bank.", reply_markup=back_to_admin_markup())
+        return
+    
+    if message.document:
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            text = downloaded_file.decode('utf-8')
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Lỗi đọc file: {e}")
+            return
+    elif message.text:
+        text = message.text.strip()
+    
+    if not text:
+        bot.send_message(chat_id, "❌ Không tìm thấy dữ liệu!")
+        return
+    
+    lines = text.split('\n')
+    added = 0
+    errors = 0
+    
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        parts = [p.strip() for p in line.split('|')]
+        
+        if len(parts) >= 3:
+            bank_type = parts[0]
+            stk = parts[1]
+            name = parts[2]
+            add_data_bank(bank_type, stk, name)
+            added += 1
+        else:
+            errors += 1
+    
+    bot.send_message(chat_id,
+        f"✅ <b>HOÀN TẤT THÊM DATA BANK</b>\n\n"
+        f"✅ Thêm thành công: <b>{added}</b>\n"
+        f"❌ Lỗi định dạng: <b>{errors}</b>",
+        reply_markup=back_to_admin_markup()
+    )
+
+
+def show_shop_inventory(chat_id, msg_id, inventory_type):
+    """Hiển thị kho hàng"""
+    markup = InlineKeyboardMarkup()
+    
+    if inventory_type == "acc":
+        summary = get_shop_accounts_summary()
+        if not summary:
+            text = "📋 <b>KHO ACC TRỐNG</b>\n\nKhông có acc nào trong kho."
+            markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+        else:
+            buttons = []
+            for item in summary:
+                buttons.append(InlineKeyboardButton(f"🎮 {item['site'].upper()} ({item['count']})", callback_data=f"adm_shop_acc_detail_{item['site']}"))
+            markup.add(*buttons)
+            markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+            
+            text = "📋 <b>KHO ACC TÂN THỦ</b>\n\n" + "\n".join([f"🎮 {s['site'].upper()}: {s['count']} acc" for s in summary])
+    
+    else:  # dbank
+        summary = get_available_data_banks_summary()
+        if not summary:
+            text = "📋 <b>KHO DATA BANK TRỐNG</b>\n\nKhông có data bank nào trong kho."
+            markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+        else:
+            buttons = []
+            for item in summary:
+                buttons.append(InlineKeyboardButton(f"📁 {item['bank_type']} ({item['count']})", callback_data=f"adm_shop_dbank_detail_{item['bank_type']}"))
+            markup.add(*buttons)
+            markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop"))
+            
+            text = "📋 <b>KHO DATA BANK</b>\n\n" + "\n".join([f"📁 {b['bank_type']}: {b['count']} data" for b in summary])
+    
+    _safe_edit(chat_id, msg_id, text, markup)
+
+
+def get_shop_accounts_summary():
+    """Lấy thống kê kho acc"""
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            cur.execute("""
+                SELECT site, COUNT(*) as count 
+                FROM shop_accounts 
+                WHERE is_sold = 0 
+                GROUP BY site 
+                ORDER BY site
+            """)
+            return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error getting shop accounts summary: {e}")
+        return []
+
+
+def get_available_data_banks_summary():
+    """Lấy thống kê kho data bank"""
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            cur.execute("""
+                SELECT bank_type, COUNT(*) as count 
+                FROM data_banks 
+                WHERE is_sold = 0 
+                GROUP BY bank_type 
+                ORDER BY bank_type
+            """)
+            return [dict(row) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Error getting data banks summary: {e}")
+        return []
+
+
+def add_shop_accounts_bulk(accounts):
+    """Thêm nhiều acc vào kho"""
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            for acc in accounts:
+                cur.execute("""
+                    INSERT INTO shop_accounts 
+                    (site, username, password, realname, pin, is_sold, created_at)
+                    VALUES (?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+                """, (acc['site'], acc['username'], acc['password'], acc['realname'], acc['pin']))
+            c.commit()
+    except Exception as e:
+        print(f"Error adding shop accounts: {e}")
+
+
+def back_to_admin_markup():
+    """Tạo nút quay lại admin panel"""
+    return InlineKeyboardMarkup().row(
+        InlineKeyboardButton("🔙 Quay lại Admin", callback_data="adm_main")
+    )
+
+
+def show_acc_detail(chat_id, msg_id, site):
+    """Hiển thị chi tiết acc theo site"""
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            cur.execute("""
+                SELECT id, username, password, realname, pin, created_at
+                FROM shop_accounts 
+                WHERE site = ? AND is_sold = 0 
+                ORDER BY created_at DESC
+                LIMIT 20
+            """, (site,))
+            
+            accounts = cur.fetchall()
+            
+            if not accounts:
+                text = f"📋 <b>KHO ACC {site.upper()} TRỐNG</b>\n\nKhông có acc nào trong kho."
+                markup = InlineKeyboardMarkup().row(
+                    InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop_view_acc")
+                )
+            else:
+                text = f"📋 <b>KHO ACC {site.upper()}</b>\n\n"
+                for i, acc in enumerate(accounts, 1):
+                    text += f"{i}. <code>{acc['username']}</code> | {acc['realname'] or 'N/A'} | PIN: {acc['pin']}\n"
+                
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("🔄 Làm mới", callback_data=f"adm_shop_acc_detail_{site}"))
+                markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop_view_acc"))
+            
+            _safe_edit(chat_id, msg_id, text, markup)
+            
+    except Exception as e:
+        _safe_edit(chat_id, msg_id, f"❌ Lỗi tải dữ liệu: {e}")
+
+
+def show_dbank_detail(chat_id, msg_id, bank_type):
+    """Hiển thị chi tiết data bank theo loại"""
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            cur.execute("""
+                SELECT id, stk, name, created_at
+                FROM data_banks 
+                WHERE bank_type = ? AND is_sold = 0 
+                ORDER BY created_at DESC
+                LIMIT 20
+            """, (bank_type,))
+            
+            data_banks = cur.fetchall()
+            
+            if not data_banks:
+                text = f"📋 <b>KHO DATA BANK {bank_type} TRỐNG</b>\n\nKhông có data nào trong kho."
+                markup = InlineKeyboardMarkup().row(
+                    InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop_view_dbank")
+                )
+            else:
+                text = f"📋 <b>KHO DATA BANK {bank_type}</b>\n\n"
+                for i, data in enumerate(data_banks, 1):
+                    text += f"{i}. <code>{data['stk']}</code> | {data['name']}\n"
+                
+                markup = InlineKeyboardMarkup()
+                markup.row(InlineKeyboardButton("🔄 Làm mới", callback_data=f"adm_shop_dbank_detail_{bank_type}"))
+                markup.row(InlineKeyboardButton("🔙 Quay lại", callback_data="adm_shop_view_dbank"))
+            
+            _safe_edit(chat_id, msg_id, text, markup)
+            
+    except Exception as e:
+        _safe_edit(chat_id, msg_id, f"❌ Lỗi tải dữ liệu: {e}")
+
+
+def process_delete_acc(message):
+    """Xử lý xóa acc"""
+    chat_id = message.chat.id
+    text = ""
+    
+    if message.text and message.text.strip().lower() == "/huy":
+        bot.send_message(chat_id, "✅ Đã hủy xóa acc.", reply_markup=back_to_admin_markup())
+        return
+    
+    if message.document:
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            text = downloaded_file.decode('utf-8')
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Lỗi đọc file: {e}")
+            return
+    elif message.text:
+        text = message.text.strip()
+    
+    if not text:
+        bot.send_message(chat_id, "❌ Không tìm thấy dữ liệu!")
+        return
+    
+    lines = text.split('\n')
+    deleted = 0
+    not_found = 0
+    
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            for line in lines:
+                username = line.strip()
+                if not username: continue
+                
+                cur.execute("DELETE FROM shop_accounts WHERE username = ? AND is_sold = 0", (username,))
+                if cur.rowcount > 0:
+                    deleted += 1
+                else:
+                    not_found += 1
+            c.commit()
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Lỗi xóa acc: {e}")
+        return
+    
+    bot.send_message(chat_id,
+        f"✅ <b>HOÀN TẤT XÓA ACC</b>\n\n"
+        f"✅ Đã xóa: <b>{deleted}</b>\n"
+        f"❌ Không tìm thấy: <b>{not_found}</b>",
+        reply_markup=back_to_admin_markup()
+    )
+
+
+def process_delete_dbank(message):
+    """Xử lý xóa data bank"""
+    chat_id = message.chat.id
+    text = ""
+    
+    if message.text and message.text.strip().lower() == "/huy":
+        bot.send_message(chat_id, "✅ Đã hủy xóa data bank.", reply_markup=back_to_admin_markup())
+        return
+    
+    if message.document:
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            text = downloaded_file.decode('utf-8')
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Lỗi đọc file: {e}")
+            return
+    elif message.text:
+        text = message.text.strip()
+    
+    if not text:
+        bot.send_message(chat_id, "❌ Không tìm thấy dữ liệu!")
+        return
+    
+    lines = text.split('\n')
+    deleted = 0
+    not_found = 0
+    
+    try:
+        with db_lock:
+            c = db_conn(); cur = c.cursor()
+            for line in lines:
+                stk = line.strip()
+                if not stk: continue
+                
+                cur.execute("DELETE FROM data_banks WHERE stk = ? AND is_sold = 0", (stk,))
+                if cur.rowcount > 0:
+                    deleted += 1
+                else:
+                    not_found += 1
+            c.commit()
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Lỗi xóa data bank: {e}")
+        return
+    
+    bot.send_message(chat_id,
+        f"✅ <b>HOÀN TẤT XÓA DATA BANK</b>\n\n"
+        f"✅ Đã xóa: <b>{deleted}</b>\n"
+        f"❌ Không tìm thấy: <b>{not_found}</b>",
+        reply_markup=back_to_admin_markup()
+    )
+
+
 # ----- THỐNG KÊ -----
 def show_stats(chat_id, msg_id):
     with db_lock:
         c = db_conn(); cur = c.cursor()
+        
+        # Thống kê users và balance
         cur.execute("SELECT COUNT(*) AS cnt FROM users")
         total_users = cur.fetchone()["cnt"]
         cur.execute("SELECT IFNULL(SUM(balance), 0) AS s FROM users")
         total_balance = cur.fetchone()["s"]
+        
+        # Thống kê deposits
         cur.execute(
             "SELECT COUNT(*) AS cnt, IFNULL(SUM(amount),0) AS s "
             "FROM deposits WHERE status='success'"
@@ -1693,16 +2212,90 @@ def show_stats(chat_id, msg_id):
             "AND date(created_at) = date('now', 'localtime')"
         )
         r = cur.fetchone(); td_cnt, td_sum = r["cnt"], r["s"]
+        
+        # Thống kê OTP
+        cur.execute("SELECT COUNT(*) AS cnt FROM rent_history")
+        total_otp_rents = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt, IFNULL(SUM(price),0) AS s "
+            "FROM rent_history WHERE status='completed'"
+        )
+        r = cur.fetchone(); otp_success_cnt, otp_revenue = r["cnt"], r["s"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt "
+            "FROM rent_history WHERE date(rented_at) = date('now', 'localtime')"
+        )
+        today_otp = cur.fetchone()["cnt"]
+        
+        # Thống kê SHOP - Proxy
+        cur.execute("SELECT COUNT(*) AS cnt FROM proxy_orders")
+        total_proxy_orders = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt, IFNULL(SUM(price),0) AS s "
+            "FROM proxy_orders WHERE status='completed'"
+        )
+        r = cur.fetchone(); proxy_success_cnt, proxy_revenue = r["cnt"], r["s"]
+        
+        # Thống kê SHOP - ACC
+        cur.execute("SELECT COUNT(*) AS cnt FROM shop_accounts WHERE is_sold = 0")
+        acc_available = cur.fetchone()["cnt"]
+        cur.execute("SELECT COUNT(*) AS cnt FROM shop_accounts WHERE is_sold = 1")
+        acc_sold = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt, IFNULL(SUM(price),0) AS s "
+            "FROM shop_accounts WHERE is_sold = 1"
+        )
+        r = cur.fetchone(); acc_sold_cnt, acc_revenue = r["cnt"], r["s"]
+        
+        # Thống kê SHOP - Data Bank
+        cur.execute("SELECT COUNT(*) AS cnt FROM data_banks WHERE is_sold = 0")
+        dbank_available = cur.fetchone()["cnt"]
+        cur.execute("SELECT COUNT(*) AS cnt FROM data_banks WHERE is_sold = 1")
+        dbank_sold = cur.fetchone()["cnt"]
+        cur.execute(
+            "SELECT COUNT(*) AS cnt, IFNULL(SUM(price),0) AS s "
+            "FROM data_banks WHERE is_sold = 1"
+        )
+        r = cur.fetchone(); dbank_sold_cnt, dbank_revenue = r["cnt"], r["s"]
+        
         c.close()
+
+    # Tính tổng doanh thu
+    total_revenue = otp_revenue + proxy_revenue + acc_revenue + dbank_revenue
 
     text = (
         "📊 <b>THỐNG KÊ NEWBOT</b>\n\n"
         f"👥 Tổng user: <b>{total_users:,}</b>\n"
         f"💰 Tổng số dư đang giữ: <b>{total_balance:,}đ</b>\n\n"
-        f"━━━ <b>GIAO DỊCH</b> ━━━\n"
+        
+        f"━━━ <b>GIAO DỊCH NẠP TIỀN</b> ━━━\n"
         f"✅ Thành công: <b>{ok_cnt:,}</b> giao dịch / <b>{ok_sum:,}đ</b>\n"
         f"❌ Dưới hạn mức: <b>{rj_cnt:,}</b> giao dịch / <b>{rj_sum:,}đ</b>\n"
-        f"📅 Hôm nay (thành công): <b>{td_cnt:,}</b> / <b>{td_sum:,}đ</b>"
+        f"📅 Hôm nay: <b>{td_cnt:,}</b> / <b>{td_sum:,}đ</b>\n\n"
+        
+        f"━━━ <b>DỊCH VỤ OTP</b> ━━━\n"
+        f"🔢 Tổng lượt thuê: <b>{total_otp_rents:,}</b>\n"
+        f"✅ Hoàn thành: <b>{otp_success_cnt:,}</b>\n"
+        f"💸 Doanh thu OTP: <b>{otp_revenue:,}đ</b>\n"
+        f"📅 Hôm nay: <b>{today_otp:,}</b> lượt\n\n"
+        
+        f"━━━ <b>SHOP PROXY</b> ━━━\n"
+        f"📡 Tổng đơn: <b>{total_proxy_orders:,}</b>\n"
+        f"✅ Hoàn thành: <b>{proxy_success_cnt:,}</b>\n"
+        f"💸 Doanh thu Proxy: <b>{proxy_revenue:,}đ</b>\n\n"
+        
+        f"━━━ <b>SHOP ACC TÂN THỦ</b> ━━━\n"
+        f"🎮 Còn kho: <b>{acc_available:,}</b>\n"
+        f"✅ Đã bán: <b>{acc_sold:,}</b>\n"
+        f"💸 Doanh thu ACC: <b>{acc_revenue:,}đ</b>\n\n"
+        
+        f"━━━ <b>SHOP DATA BANK</b> ━━━\n"
+        f"💳 Còn kho: <b>{dbank_available:,}</b>\n"
+        f"✅ Đã bán: <b>{dbank_sold:,}</b>\n"
+        f"💸 Doanh thu Data Bank: <b>{dbank_revenue:,}đ</b>\n\n"
+        
+        f"━━━ <b>TỔNG DOANH THU</b> ━━━\n"
+        f"💰 <b>{total_revenue:,}đ</b>"
     )
     _safe_edit(chat_id, msg_id, text, back_to_admin_markup())
 
