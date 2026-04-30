@@ -88,15 +88,12 @@ SERVICES = {
 }
 
 # Import ViOTP API
-# try:
-#     from viotp import ViOTP
-#     viotp_api = ViOTP(VIOTP_TOKEN)
-# except ImportError:
-#     print("Warning: viotp library not installed. Install with: pip install viotp")
-#     viotp_api = None
-
-# Tạm thời disable viotp để bot có thể chạy
-viotp_api = None
+try:
+    from viotp import ViOTP
+    viotp_api = ViOTP(VIOTP_TOKEN)
+except Exception as e:
+    print(f"Warning: ViOTP unavailable: {e}")
+    viotp_api = None
 
 # DB & polling
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
@@ -241,6 +238,34 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        for table, column, definition in [
+            ("rent_history", "price", "INTEGER DEFAULT 0"),
+            ("rent_history", "cost", "INTEGER DEFAULT 0"),
+            ("rent_history", "rented_at", "TIMESTAMP"),
+            ("rent_history", "created_at", "TIMESTAMP"),
+            ("data_banks", "price", "INTEGER DEFAULT 0"),
+            ("data_banks", "is_sold", "INTEGER DEFAULT 0"),
+            ("data_banks", "status", "TEXT DEFAULT 'available'"),
+            ("shop_accounts", "price", "INTEGER DEFAULT 0"),
+            ("shop_accounts", "is_sold", "INTEGER DEFAULT 0"),
+            ("shop_accounts", "status", "TEXT DEFAULT 'available'"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            except Exception:
+                pass
+
+        cur.execute("UPDATE rent_history SET price=cost WHERE IFNULL(price,0)=0 AND IFNULL(cost,0)>0")
+        cur.execute("UPDATE rent_history SET cost=price WHERE IFNULL(cost,0)=0 AND IFNULL(price,0)>0")
+        cur.execute("UPDATE rent_history SET rented_at=created_at WHERE rented_at IS NULL AND created_at IS NOT NULL")
+        cur.execute("UPDATE rent_history SET created_at=rented_at WHERE created_at IS NULL AND rented_at IS NOT NULL")
+        cur.execute("UPDATE data_banks SET is_sold=1 WHERE status='sold'")
+        cur.execute("UPDATE data_banks SET status='sold' WHERE is_sold=1")
+        cur.execute("UPDATE data_banks SET status='available' WHERE is_sold=0 AND (status IS NULL OR status='')")
+        cur.execute("UPDATE shop_accounts SET is_sold=1 WHERE status='sold'")
+        cur.execute("UPDATE shop_accounts SET status='sold' WHERE is_sold=1")
+        cur.execute("UPDATE shop_accounts SET status='available' WHERE is_sold=0 AND (status IS NULL OR status='')")
         
         # Thêm các settings mới cho dịch vụ SHOP và Thuê OTP
         additional_settings = {
@@ -412,9 +437,9 @@ def add_rent(telegram_id, request_id, phone_number, service_name, cost):
         c = db_conn()
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO rent_history(telegram_id, request_id, phone_number, service_name, cost) "
-            "VALUES (?,?,?,?,?)",
-            (telegram_id, request_id, phone_number, service_name, cost),
+            "INSERT INTO rent_history(telegram_id, request_id, phone_number, service_name, price, cost, status, rented_at, created_at) "
+            "VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            (telegram_id, request_id, phone_number, service_name, cost, cost, "pending"),
         )
         c.commit()
         c.close()
@@ -453,7 +478,7 @@ def get_available_data_banks_summary():
         cur = c.cursor()
         cur.execute(
             "SELECT bank_type, COUNT(*) as count FROM data_banks "
-            "WHERE status='available' GROUP BY bank_type"
+            "WHERE is_sold=0 GROUP BY bank_type"
         )
         result = [dict(row) for row in cur.fetchall()]
         c.close()
@@ -462,12 +487,13 @@ def get_available_data_banks_summary():
 
 def buy_multiple_data_banks(telegram_id, bank_type, amount):
     """Mua nhiều data bank"""
+    price = get_user_price(telegram_id, "price_databank")
     with db_lock:
         c = db_conn()
         cur = c.cursor()
         cur.execute(
             "SELECT id, stk, name FROM data_banks "
-            "WHERE bank_type=? AND status='available' LIMIT ?",
+            "WHERE bank_type=? AND is_sold=0 LIMIT ?",
             (bank_type, amount),
         )
         banks = [dict(row) for row in cur.fetchall()]
@@ -476,8 +502,8 @@ def buy_multiple_data_banks(telegram_id, bank_type, amount):
             bank_ids = [b["id"] for b in banks]
             placeholders = ",".join("?" * len(bank_ids))
             cur.execute(
-                f"UPDATE data_banks SET status='sold', sold_to=? WHERE id IN ({placeholders})",
-                [telegram_id] + bank_ids,
+                f"UPDATE data_banks SET is_sold=1, status='sold', sold_to=?, price=? WHERE id IN ({placeholders})",
+                [telegram_id, price] + bank_ids,
             )
             c.commit()
         
@@ -507,7 +533,7 @@ def get_shop_accounts_summary():
         cur = c.cursor()
         cur.execute(
             "SELECT site, COUNT(*) as count FROM shop_accounts "
-            "WHERE status='available' GROUP BY site"
+            "WHERE is_sold=0 GROUP BY site"
         )
         result = [dict(row) for row in cur.fetchall()]
         c.close()
@@ -521,7 +547,7 @@ def get_shop_account_count(site):
         cur = c.cursor()
         cur.execute(
             "SELECT COUNT(*) as count FROM shop_accounts "
-            "WHERE site=? AND status='available'",
+            "WHERE site=? AND is_sold=0",
             (site,),
         )
         result = cur.fetchone()
@@ -531,12 +557,13 @@ def get_shop_account_count(site):
 
 def buy_shop_accounts(telegram_id, site, amount):
     """Mua acc từ shop"""
+    price = get_user_price(telegram_id, "price_shopacc")
     with db_lock:
         c = db_conn()
         cur = c.cursor()
         cur.execute(
             "SELECT id, username, password, realname, pin FROM shop_accounts "
-            "WHERE site=? AND status='available' LIMIT ?",
+            "WHERE site=? AND is_sold=0 LIMIT ?",
             (site, amount),
         )
         accounts = [dict(row) for row in cur.fetchall()]
@@ -545,8 +572,8 @@ def buy_shop_accounts(telegram_id, site, amount):
             account_ids = [a["id"] for a in accounts]
             placeholders = ",".join("?" * len(account_ids))
             cur.execute(
-                f"UPDATE shop_accounts SET status='sold', sold_to=? WHERE id IN ({placeholders})",
-                [telegram_id] + account_ids,
+                f"UPDATE shop_accounts SET is_sold=1, status='sold', sold_to=?, price=? WHERE id IN ({placeholders})",
+                [telegram_id, price] + account_ids,
             )
             c.commit()
         
@@ -876,7 +903,8 @@ def _save_qr_message(tid, message_id):
 
 def main_menu():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("💰 Nạp Tiền"), KeyboardButton("🚀 Tạo Nick"))
+    kb.row(KeyboardButton("💰 Nạp Tiền"), KeyboardButton("🎁 Thuê Số Ngay"))
+    kb.row(KeyboardButton("🛒 SHOP"), KeyboardButton("🚀 Tạo Nick"))
     kb.row(KeyboardButton("👤 Cá Nhân"), KeyboardButton("📖 Hướng Dẫn"))
     kb.row(KeyboardButton("☎️ CSKH"))
     return kb
@@ -1070,24 +1098,7 @@ def cmd_huy(m):
 
 def main_menu_markup():
     """Menu chính cho người dùng"""
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(
-        KeyboardButton("👤 Cá Nhân"),
-        KeyboardButton("💰 Nạp Tiền")
-    )
-    kb.row(
-        KeyboardButton("🎁 Thuê Số Ngay"),
-        KeyboardButton("🛒 SHOP")
-    )
-    kb.row(
-        KeyboardButton("🚀 Reg Acc (Chỉ Tạo)"),
-        KeyboardButton("🤖 Auto Reg + KM")
-    )
-    kb.row(
-        KeyboardButton("📖 Hướng Dẫn"),
-        KeyboardButton("☎️ CSKH")
-    )
-    return kb
+    return main_menu()
 
 
 def shop_menu_markup():
@@ -1397,6 +1408,15 @@ def process_buy_proxy_step(message, provider):
     if result["status"] == "success":
         proxies = result["proxies"]
         proxy_text = "\n".join([f"<code>{p}</code>" for p in proxies])
+        with db_lock:
+            c = db_conn()
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO proxy_orders(telegram_id, provider, quantity, price, status, proxy_data) VALUES (?,?,?,?,?,?)",
+                (cid, provider, len(proxies), total_cost, "completed", "\n".join(proxies)),
+            )
+            c.commit()
+            c.close()
         
         success_text = (
             f"✅ <b>MUA {len(proxies)} PROXY {provider} THÀNH CÔNG!</b>\n\n"
@@ -1411,6 +1431,15 @@ def process_buy_proxy_step(message, provider):
         # Hoàn tiền khi lỗi
         add_balance(cid, total_cost)
         error_msg = result.get("message", "Lỗi không xác định")
+        with db_lock:
+            c = db_conn()
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO proxy_orders(telegram_id, provider, quantity, price, status, proxy_data) VALUES (?,?,?,?,?,?)",
+                (cid, provider, amount, total_cost, "failed", error_msg),
+            )
+            c.commit()
+            c.close()
         bot.edit_message_text(f"❌ <b>MUA PROXY THẤT BẠI</b>\n\n⚠️ Lý do: {error_msg}\n🔙 Đã hoàn lại <b>{total_cost:,} VNĐ</b>.", cid, loading_msg.message_id, parse_mode='HTML')
 
 
@@ -2218,7 +2247,7 @@ def show_stats(chat_id, msg_id):
         total_otp_rents = cur.fetchone()["cnt"]
         cur.execute(
             "SELECT COUNT(*) AS cnt, IFNULL(SUM(price),0) AS s "
-            "FROM rent_history WHERE status='completed'"
+            "FROM rent_history WHERE status IN ('success', 'completed')"
         )
         r = cur.fetchone(); otp_success_cnt, otp_revenue = r["cnt"], r["s"]
         cur.execute(
