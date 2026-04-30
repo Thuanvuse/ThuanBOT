@@ -1,0 +1,10 @@
+# ─── Bot core ───────────────────────────────
+pyTelegramBotAPI==4.14.0
+requests==2.31.0
+
+# ─── Reg module deps (cho Tạo Nick OKVIP/KJC) ───
+# Module reg/ gọi REG_API_SERVER/autoreg_v2.py qua subprocess.
+# Cần các thư viện mà autoreg_v2 + Reg Nha KJC/core_logic đang dùng:
+curl_cffi>=0.5.10       # HTTP client với fingerprint Chrome (impersonate)
+rsa>=4.9                # RSA encryption cho login/register
+pycryptodome>=3.19.0    # AES-CBC encryption
